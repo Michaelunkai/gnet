@@ -58,6 +58,7 @@ Scripts that trust exit codes report success while nothing is installed. **gnet 
 * **Future-proof** — package IDs are parsed from `winget search` at run time, so .NET 11, 12, … are picked up with zero code changes.
 * **Truth from disk** — a target is "installed" only when its files exist under a dotnet root.
 * **Escalation ladder** — five different strategies per target, with retries on `1618` (another install running).
+* **Environment finish** — once the machine root is complete, `DOTNET_ROOT` and `PATH` are repointed so every host (apphosts, `dotnet` on PATH) sees all versions, then the change is broadcast to running apps — no reboot, no re-login.
 * **No surprise reboots** — a guard thread aborts any installer-initiated shutdown; gnet only *reports* `3010`.
 * **Zero dependencies** — pure `std` Rust, a ~300 KB executable, shells out only to Windows' own `winget`, `reg`, `curl` and `cmd`.
 * **Self-elevating** — relaunches itself as administrator when needed.

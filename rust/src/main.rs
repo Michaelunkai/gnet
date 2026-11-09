@@ -288,10 +288,16 @@ fn dotnet_roots() -> Vec<PathBuf> {
     r
 }
 
-/// Everything really present on disk: "fw/Microsoft.NETCore.App/3.1.32", "sdk/3.1.426".
+/// What the machine-wide root really holds: "fw/Microsoft.NETCore.App/3.1.32", "sdk/3.1.426".
+/// Only `%ProgramFiles%\dotnet` counts - portable copies elsewhere must never
+/// make a target look installed, or the machine-wide dotnet stays incomplete.
 fn installed_set() -> BTreeSet<String> {
+    root_set(&pf().join("dotnet"))
+}
+
+fn root_set(root: &Path) -> BTreeSet<String> {
     let mut s = BTreeSet::new();
-    for root in dotnet_roots() {
+    for root in [root.to_path_buf()] {
         if let Ok(rd) = fs::read_dir(root.join("shared")) {
             for fw in rd.flatten() {
                 if let Ok(vs) = fs::read_dir(fw.path()) {
@@ -316,6 +322,112 @@ fn installed_set() -> BTreeSet<String> {
 
 fn non_empty(p: &Path) -> bool {
     fs::read_dir(p).map(|mut r| r.next().is_some()).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------- environment finish
+
+extern "system" {
+    fn SendMessageTimeoutW(h: isize, msg: u32, w: usize, l: *const u16, flags: u32, timeout: u32, res: *mut usize) -> isize;
+}
+
+/// Tell running apps (Explorer, new shells) to reload the environment: no reboot, no re-login.
+fn broadcast_env() {
+    let w: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut r = 0usize;
+    unsafe { SendMessageTimeoutW(0xFFFF, 0x001A, 0, w.as_ptr(), 2, 5000, &mut r) };
+    log("OK", "environment change broadcast to running applications (no reboot needed)");
+}
+
+fn reg_raw(key: &str, name: &str) -> Option<(String, String)> {
+    let o = reg_query(&[key, "/v", name]);
+    if o.code != 0 {
+        return None;
+    }
+    for l in o.text.lines() {
+        let l = l.trim();
+        if l.starts_with(name) {
+            for ty in ["REG_EXPAND_SZ", "REG_SZ"] {
+                if let Some(i) = l.find(ty) {
+                    return Some((ty.to_string(), l[i + ty.len()..].trim().to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn same_dir(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('\\').eq_ignore_ascii_case(b.trim().trim_end_matches('\\'))
+}
+
+/// Once the machine root is complete, make every host agree with it:
+///  - DOTNET_ROOT must not point at a folder that is a subset of the machine root
+///  - the machine root must come before any smaller portable dotnet on PATH
+fn finish_environment(report_dir: &Path) {
+    let machine = pf().join("dotnet");
+    let ms = root_set(&machine);
+    let mstr = machine.to_string_lossy().to_string();
+    let mut changed = false;
+    let scopes = [
+        ("HKCU\\Environment", "user"),
+        ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "machine"),
+    ];
+    for (key, label) in scopes {
+        if let Some((_, val)) = reg_raw(key, "DOTNET_ROOT") {
+            if !same_dir(&val, &mstr) && root_set(Path::new(&val)).is_subset(&ms) {
+                log("WARN", &format!("{label} DOTNET_ROOT '{val}' hides installed versions - pointing it at {mstr}"));
+                let o = run("reg", &["add", key, "/v", "DOTNET_ROOT", "/t", "REG_SZ", "/d", &mstr, "/f"], 30, "reg add", true);
+                changed |= o.code == 0;
+            }
+        }
+        if let Some((ty, val)) = reg_raw(key, "Path") {
+            let parts: Vec<String> = val.split(';').filter(|p| !p.trim().is_empty()).map(|s| s.to_string()).collect();
+            let idx = parts.iter().position(|p| same_dir(p, &mstr));
+            let first_other = parts.iter().position(|p| {
+                !same_dir(p, &mstr) && {
+                    let ex = expand_env(p);
+                    Path::new(&ex).join("dotnet.exe").is_file() && !ex.contains("(x86)") && !root_set(Path::new(&ex)).is_superset(&ms)
+                }
+            });
+            let want_move = match (idx, first_other) {
+                (Some(i), Some(o)) => i > o,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if want_move {
+                let _ = fs::write(report_dir.join(format!("path-backup-{label}-{}.txt", stamp())), &val);
+                let mut np = vec![format!("{mstr}\\")];
+                np.extend(parts.iter().filter(|p| !same_dir(p, &mstr)).cloned());
+                let joined = np.join(";");
+                log("WARN", &format!("{label} PATH: moving {mstr} ahead of smaller portable dotnet hosts"));
+                let o = run("reg", &["add", key, "/v", "Path", "/t", &ty, "/d", &joined, "/f"], 30, "reg add", true);
+                changed |= o.code == 0;
+            }
+        }
+    }
+    if changed {
+        broadcast_env();
+    } else {
+        log("OK", "environment already consistent: DOTNET_ROOT and PATH agree with the machine root");
+    }
+}
+
+fn expand_env(p: &str) -> String {
+    let mut out = String::new();
+    let mut rest = p;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        if let Some(j) = rest[i + 1..].find('%') {
+            let name = &rest[i + 1..i + 1 + j];
+            out.push_str(&std::env::var(name).unwrap_or_else(|_| format!("%{name}%")));
+            rest = &rest[i + j + 2..];
+        } else {
+            out.push_str(&rest[i..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------- catalog
@@ -791,6 +903,9 @@ fn real_main(scan_only: bool, force: bool, timeout: u64, only: Option<Vec<String
         log("ERROR", &format!("{} : FAILED after all repair strategies", t.id));
     }
 
+    if failed.is_empty() {
+        finish_environment(&home_dir().join("Reports"));
+    }
     // final truth: what the real dotnet host reports
     for h in dotnet_roots() {
         let exe = h.join("dotnet.exe");
