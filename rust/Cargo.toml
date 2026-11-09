@@ -1,0 +1,15 @@
+[package]
+name = "gnet"
+version = "1.0.0"
+edition = "2021"
+description = "Self-healing .NET installer/repair tool for Windows - any .NET version, verified against the real filesystem"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
